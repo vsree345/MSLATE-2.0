@@ -1,0 +1,10 @@
+langgraph>=1.0
+pandas
+numpy
+openpyxl
+fastapi
+uvicorn[standard]
+anthropic>=2.0        # AI analyst (optional; needs ANTHROPIC_API_KEY)
+pytest                # tests/
+# optional: graph topology viewer for the CLI run (http://localhost:8767)
+# langgraph-viz

@@ -1,2 +1,20 @@
 .claude/
 venv/
+__pycache__/
+.pytest_cache/
+logs/
+trapx.pid
+
+# secrets — API keys live only in .env
+.env
+.env.*
+
+# personal / academic documents and Office lock files
+Batch_21_Project_report.pdf
+DRAVYAGATI.pptx
+~$*
+
+# downloaded third-party datasets (licences forbid redistribution); keep the manifest
+data/external/*
+!data/external/MANIFEST.md
+data/sessions/

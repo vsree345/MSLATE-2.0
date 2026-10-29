@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TRAP-X · Dravyagati</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/styles.css">
+  <script>
+    try { const t = localStorage.getItem("trapx-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <svg class="mark" viewBox="0 0 20 20" aria-hidden="true">
+        <circle cx="10" cy="10" r="8.25" fill="none" stroke="currentColor" stroke-width="1.5"/>
+        <path d="M10 1.75a8.25 8.25 0 0 1 0 16.5z" fill="currentColor"/>
+      </svg>
+      <span class="wordmark">TRAP-X</span>
+      <span class="sub">Dravyagati</span>
+    </div>
+    <div class="session-meta">
+      <span>NIFTY 50</span><span class="dot">·</span><span>Fri 20 Feb 2026</span><span class="dot">·</span><span>Historical replay</span>
+    </div>
+    <div class="controls">
+      <span class="status" id="status" data-state="idle"><i></i><span id="status-text">Idle</span></span>
+      <div class="seg" id="speed" role="radiogroup" aria-label="Replay speed">
+        <button role="radio" data-speed="1x">1×</button>
+        <button role="radio" data-speed="4x" aria-checked="true">4×</button>
+        <button role="radio" data-speed="max">Max</button>
+      </div>
+      <button class="btn primary" id="run"><span>Run replay</span><kbd>R</kbd></button>
+      <button class="btn icon" id="theme" aria-label="Toggle theme" title="Toggle theme (T)">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="5.5" fill="none" stroke="currentColor" stroke-width="1.25"/><path d="M8 2.5a5.5 5.5 0 0 1 0 11z" fill="currentColor"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <main class="page">
+    <!-- Masthead -->
+    <section class="masthead">
+      <div class="headline">
+        <div class="eyebrow"><span class="num">01</span>Session <span id="cursor-label" class="cursor-label">—</span></div>
+        <div class="price-row">
+          <span class="price" id="price">—</span>
+          <span class="delta" id="delta"></span>
+        </div>
+        <p class="lede" id="lede">Replay the 20 Feb session to watch the agent reason, one closed minute at a time.</p>
+      </div>
+      <dl class="figures" id="figures">
+        <div><dt>PDH</dt><dd id="f-pdh">—</dd></div>
+        <div><dt>PDL</dt><dd id="f-pdl">—</dd></div>
+        <div><dt>PDC</dt><dd id="f-pdc">—</dd></div>
+        <div><dt>India VIX</dt><dd id="f-vix">—</dd></div>
+        <div><dt>Exp. move / min</dt><dd id="f-em">—</dd></div>
+        <div><dt>Regime</dt><dd id="f-regime">—</dd></div>
+        <div><dt>Conviction</dt><dd id="f-score">—</dd></div>
+        <div><dt>Position</dt><dd id="f-pos">—</dd></div>
+        <div><dt>Realized P&amp;L</dt><dd id="f-pnl">—</dd></div>
+        <div><dt>Max drawdown</dt><dd id="f-dd">—</dd></div>
+        <div><dt>Bars</dt><dd id="f-bars">—</dd></div>
+        <div><dt>Latency / bar</dt><dd id="f-lat">—</dd></div>
+      </dl>
+    </section>
+
+    <div class="workspace">
+      <!-- Chart -->
+      <section class="chart-col">
+        <div class="section-head">
+          <h2><span class="num">02</span>Price &amp; structure</h2>
+          <ul class="legend">
+            <li><i class="sw candle"></i>Spot</li>
+            <li><i class="sw line accent"></i>TWAP</li>
+            <li><i class="sw dash"></i>PDL · PDC</li>
+            <li><i class="sw tri up"></i>Call</li>
+            <li><i class="sw tri down"></i>Put</li>
+            <li><i class="sw ghost"></i>Gated</li>
+            <li><i class="sw dot"></i>Exit</li>
+          </ul>
+        </div>
+        <div class="readout" id="readout">&nbsp;</div>
+        <div class="chart-wrap" id="chart-wrap">
+          <canvas id="chart"></canvas>
+          <div class="empty" id="empty">
+            <p class="serif">The session hasn’t been replayed yet.</p>
+            <p>Press <kbd>R</kbd> or <b>Run replay</b>. Each 1-minute bar runs through nine graph nodes in order.</p>
+          </div>
+        </div>
+        <p class="hint">Hover to inspect a bar · click to pin · <kbd>←</kbd><kbd>→</kbd> step · <kbd>Esc</kbd> back to latest</p>
+      </section>
+
+      <!-- Rail -->
+      <aside class="rail">
+        <section class="rail-sec">
+          <div class="section-head">
+            <h2><span class="num">03</span>Pipeline</h2>
+            <span class="meta" id="pipe-meta">13 nodes</span>
+          </div>
+          <ol class="pipeline" id="pipeline">
+            <li data-node="process_mkt_open" class="once"><span>process_mkt_open</span><em>09:15 only</em></li>
+            <li data-node="process_minute"><span>process_minute</span></li>
+            <li data-node="market_memory_engine"><span>market_memory_engine</span><em>L1</em></li>
+            <li data-node="regime_detector"><span>regime_detector</span><em>L2</em></li>
+            <li data-node="check_trigger"><span>check_trigger</span></li>
+            <li data-node="breakout_validator"><span>breakout_validator</span><em>real/fake</em></li>
+            <li data-node="workflow_strategy_engine"><span>workflow_strategy_engine</span><em>S1–S5</em></li>
+            <li data-node="trap_trigger_engine"><span>trap_trigger_engine</span><em>L3</em></li>
+            <li data-node="conviction_gate"><span>conviction_gate</span><em>≥ 70</em></li>
+            <li data-node="position_manager"><span>position_manager</span><em>risk</em></li>
+            <li data-node="trade_lifecycle_manager"><span>trade_lifecycle_manager</span></li>
+            <li data-node="ai_analyst"><span>ai_analyst</span><em>async</em></li>
+            <li data-node="minute_summary"><span>minute_summary</span></li>
+          </ol>
+        </section>
+
+        <section class="rail-sec">
+          <div class="section-head">
+            <h2><span class="num">04</span>Strategies</h2>
+            <span class="meta">Workflow engine</span>
+          </div>
+          <ul class="strategies" id="strategies"></ul>
+        </section>
+
+        <section class="rail-sec">
+          <div class="section-head">
+            <h2><span class="num">05</span>Conviction</h2>
+            <span class="meta" id="conv-meta">—</span>
+          </div>
+          <p class="conv-src" id="conv-src">Bar score</p>
+          <div class="scorebar" id="scorebar"><i class="fill"></i><i class="tick" style="left:70%"></i></div>
+          <ul class="checklist" id="checklist"></ul>
+        </section>
+
+        <section class="rail-sec">
+          <div class="section-head">
+            <h2><span class="num">06</span>Position &amp; risk</h2>
+            <span class="meta" id="pos-meta">—</span>
+          </div>
+          <dl class="kv" id="position"></dl>
+          <div class="riskbar" id="riskbar" title="Drawdown vs daily kill switch"><i class="fill"></i></div>
+          <p class="risk-note" id="risk-note">—</p>
+        </section>
+
+        <section class="rail-sec">
+          <div class="section-head">
+            <h2><span class="num">07</span>AI analyst</h2>
+            <span class="meta" id="ai-meta">—</span>
+          </div>
+          <div class="ai" id="ai"><p class="ai-off">Waiting for a replay.</p></div>
+        </section>
+      </aside>
+    </div>
+
+    <!-- Bottom tabs -->
+    <section class="bottom">
+      <div class="tabs" role="tablist">
+        <button role="tab" data-tab="ledger" aria-selected="true">Ledger <span class="count" id="ledger-count">0</span></button>
+        <div class="seg small" id="ledger-filter" role="radiogroup" aria-label="Ledger filter">
+          <button role="radio" data-f="trades" aria-checked="true">Trades</button>
+          <button role="radio" data-f="all">All</button>
+        </div>
+        <button role="tab" data-tab="log">Engine log <span class="count" id="log-count">0</span></button>
+        <button role="tab" data-tab="session">Session &amp; method</button>
+        <div class="tab-tools" id="log-tools" hidden>
+          <input id="log-filter" type="search" placeholder="Filter log — e.g. WF, TRG, SCORE" spellcheck="false">
+          <label class="check"><input type="checkbox" id="log-follow" checked> Follow</label>
+        </div>
+      </div>
+
+      <div class="tab-panel" data-panel="ledger">
+        <table class="ledger">
+          <thead><tr><th>Bar</th><th>Event</th><th>Side</th><th class="r">Price</th><th class="r">Stop</th><th class="r">Score</th><th class="r">P&amp;L</th><th>Notes</th></tr></thead>
+          <tbody id="ledger"><tr class="none"><td colspan="8">No signals yet.</td></tr></tbody>
+        </table>
+      </div>
+
+      <div class="tab-panel" data-panel="log" hidden>
+        <pre class="log" id="log"></pre>
+      </div>
+
+      <div class="tab-panel session" data-panel="session" hidden>
+        <dl class="summary" id="summary"></dl>
+        <div class="method">
+          <article>
+            <h3>The unit of measure</h3>
+            <p>Every threshold is expressed in the 1-minute expected move, derived from India VIX at the open:</p>
+            <p class="formula">EM = PDH × (VIX / 100) × √(1 / 94 500) × 1.5</p>
+          </article>
+          <article>
+            <h3>Workflow strategies</h3>
+            <p><b>S1</b> PDL breaks, an up LIS candle &gt; 2× EM confirms the bottom, the next bar holds → initial call.
+               <b>S2</b> price retests a post-entry LIS high within 1.5× EM → pyramid.
+               <b>S3</b> after 12:30, two wick rejections at the high plus ITM put selling → put.
+               <b>S4</b> after 12:30, low tags the Fib 50% with a fresh up LIS → call.</p>
+          </article>
+          <article>
+            <h3>Fake or real?</h3>
+            <p>Every PDH/PDL break starts <b>pending</b> — don’t chase. It turns <b>fake</b> if price closes back inside by half an expected move within ten bars, and <b>real</b> after five closes beyond, a 3× EM extension, or no reclaim in time. <b>S5</b> mirrors S1 for a fake break of the previous day’s high.</p>
+          </article>
+          <article>
+            <h3>Nothing trades below 70</h3>
+            <p>Strategies only propose. Each proposal is scored on six checks over the setup window — futures displacement 30, option ladder 25, volume 20, delta acceleration 10, trap structure 10, regime 5. 80+ trades full size, 70–79 half size, anything lower is logged as gated.</p>
+          </article>
+          <article>
+            <h3>Trade and risk management</h3>
+            <p>Size comes from risk: 1% of equity per full-size trade, never more than 2%. Stops are gap-aware, the target is 2R, the stop trails 1.5× EM behind the best price once a trade is +1R, and everything is squared off at 15:15. A 2.5% daily loss flattens the book and ends the day. P&amp;L is index points × lot size — a delta-1 proxy that ignores option premium, theta and IV.</p>
+          </article>
+          <article>
+            <h3>AI second opinion</h3>
+            <p>Every 15 bars, and whenever a setup is scored, a brief of the last 30 candles, levels, flow and the engine’s view goes to Gemini — or headless Claude Code if Gemini is unavailable — which answers lean buy, lean sell or wait with a confidence and reasons. It runs off the main loop, keeps only the newest brief when busy, and never blocks or vetoes a trade.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

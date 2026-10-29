@@ -39,7 +39,7 @@ from langgraph.checkpoint.memory import MemorySaver
 # Paths
 # ─────────────────────────────────────────────────────────────────────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_DATA = os.path.join(_HERE, "..", "data")
+_DATA = os.path.join(_HERE, "data")
 
 SPOT_FUT_CSV = os.path.join(_DATA, "spot_fut_2026-02-20.csv")
 SIGNALS_CSV  = os.path.join(_DATA, "signals_2026-02-20.csv")
@@ -89,6 +89,35 @@ CFG = dict(
 
     vol_threshold               = 125000,
     vix_1m_threshold            = 1.5,
+
+    # ── Promise 1 · breakout validation (PDH / PDL) ─────────────────────────
+    bo_fake_window              = 10,    # bars a breakout has to prove itself
+    bo_reclaim_em               = 0.5,   # close back inside by ≥ this × EM → FAKE
+    bo_real_hold_bars           = 5,     # consecutive closes beyond level → REAL
+    bo_real_extension_em        = 3.0,   # or extends ≥ this × EM beyond level
+    s_entry_valid_bars          = 15,    # S1/S5 setup expires N bars after its LIS
+
+    # ── Promise 3 · execution gate ──────────────────────────────────────────
+    setup_window                = 5,     # bars a setup's conviction is measured over
+    gate_full_score             = 80,    # ≥ 80 → full size; 70–79 → half size
+    gate_skip_log_every         = 5,     # dedupe repeated "skipped" log lines
+
+    # ── Promise 7 · position management ─────────────────────────────────────
+    target_r_multiple           = 2.0,   # target = entry ± 2R
+    trail_after_r               = 1.0,   # start trailing once +1R
+    trail_em_mult               = 1.5,   # trail distance = 1.5 × EM
+    no_new_entries_after        = dtime(15, 0),
+    eod_squareoff               = dtime(15, 15),
+
+    # ── Promise 9 · risk ────────────────────────────────────────────────────
+    capital                     = 1_000_000,   # INR, notional
+    lot_size                    = 65,          # NIFTY lot (index points × lot = INR)
+    risk_per_trade_pct          = 1.0,         # full-size risk budget
+    max_risk_per_trade_pct      = 2.0,         # never risk more than this on one entry
+    max_daily_loss_pct          = 2.5,         # kill switch: flatten + stop for the day
+
+    # ── Promise 8 · AI analyst ──────────────────────────────────────────────
+    ai_every_bars               = 15,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -165,6 +194,24 @@ class TrapXState(TypedDict):
     wf_wick_rejections:  int            # cumulative upper-wick rejections (S3)
     wf_last_wick_bar:    str            # bar_time of most recent wick rejection
     wf_trade_log:        List[Dict]     # workflow-specific signal & trade log
+    wf_fired:            List[str]      # once-per-day strategies already executed
+    wf_pdh_break_bar:    str            # "HH:MM" when PDH was first broken (S5)
+    wf_lis_top:          Optional[Dict] # first DOWN LIS candle after PDH break (S5)
+    wf_candidates:       List[Dict]     # setups proposed this bar (pre-gate)
+
+    # ── Breakout validator · conviction gate · positions · risk · AI ─────────
+    bo_state:            Dict           # {"PDH": {...}, "PDL": {...}}
+    gate_decisions:      List[Dict]     # this bar's scored candidates
+    gate_last_skip:      Dict           # strategy -> bar index of last logged skip
+    wf_approved:         Optional[Dict] # candidate cleared to execute this bar
+    pos:                 Optional[Dict] # open workflow position
+    exec_log:            List[Dict]     # every gate decision / fill / exit
+    realized_pnl:        float          # INR
+    equity:              float
+    equity_peak:         float
+    max_drawdown_pct:    float
+    kill_switch:         bool
+    ai_opinions:         List[Dict]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -192,9 +239,20 @@ def _atr(bars: List[Dict], period: int = 14) -> float:
         trs.append(max(h - l, abs(h - pc), abs(l - pc)))
     return sum(trs) / len(trs) if trs else 0.0
 
+def _minute_vols(fut_bars: List[Dict]) -> List[float]:
+    """Per-minute futures volume. The feed's `volume` is the day's running
+    total, so a minute's volume is the difference from the previous bar."""
+    out, prev = [], None
+    for b in fut_bars:
+        v = float(b.get("volume", 0) or 0)
+        out.append(max(0.0, v - prev) if prev is not None else 0.0)
+        prev = v
+    return out
+
 def _rolling_vol_avg(fut_bars: List[Dict], lookback: int = 20) -> float:
-    recent = fut_bars[-lookback:] if len(fut_bars) >= lookback else fut_bars
-    return sum(b.get("volume", 0) for b in recent) / len(recent) if recent else 0.0
+    """Average per-minute volume over the `lookback` bars before the latest."""
+    vols = _minute_vols(fut_bars[-(lookback + 2):])[1:-1]
+    return sum(vols) / len(vols) if vols else 0.0
 
 def _candle_overlap(bars: List[Dict], lookback: int = 30) -> float:
     recent = bars[-lookback:] if len(bars) >= lookback else bars
@@ -426,6 +484,23 @@ def process_mkt_open(state: TrapXState) -> TrapXState:
     state["wf_wick_rejections"]  = 0
     state["wf_last_wick_bar"]    = ""
     state["wf_trade_log"]        = []
+    state["wf_fired"]            = []
+    state["wf_pdh_break_bar"]    = ""
+    state["wf_lis_top"]          = None
+    state["wf_candidates"]       = []
+
+    state["bo_state"]       = {}
+    state["gate_decisions"] = []
+    state["gate_last_skip"] = {}
+    state["wf_approved"]    = None
+    state["pos"]            = None
+    state["exec_log"]       = []
+    state["realized_pnl"]   = 0.0
+    state["equity"]         = float(CFG["capital"])
+    state["equity_peak"]    = float(CFG["capital"])
+    state["max_drawdown_pct"] = 0.0
+    state["kill_switch"]    = False
+    state["ai_opinions"]    = []
 
     return state
 
@@ -498,8 +573,7 @@ def market_memory_engine(state: TrapXState) -> TrapXState:
     # Volume Node
     volume_nodes = list(state.get("volume_nodes", []))    
     if G_FUT:
-        fc      = G_FUT[-1]
-        fut_vol = fc.get("volume", 0)
+        fut_vol = _minute_vols(G_FUT[-2:])[-1]
         avg_vol = _rolling_vol_avg(G_FUT)
         if avg_vol > 0 and fut_vol > CFG["volume_node_multiplier"] * avg_vol:
             volume_nodes.append(dict(price_level=close,
@@ -650,10 +724,10 @@ def regime_detector(state: TrapXState) -> TrapXState:
     overlap        = _candle_overlap(G_SPOT, CFG["overlap_lookback"])
     active_legs    = [l for l in state.get("impulse_legs", []) if l.get("active")]
 
-    last5  = G_FUT[-5:]  if len(G_FUT) >= 5 else G_FUT
-    first5 = G_FUT[:5]   if len(G_FUT) >= 5 else G_FUT
-    fut_vol_expanding = (sum(b.get("volume", 0) for b in last5) >
-                         sum(b.get("volume", 0) for b in first5))
+    # recent per-minute participation vs the session's average minute
+    mvols = _minute_vols(G_FUT)[1:]
+    fut_vol_expanding = (len(mvols) >= 10 and
+                         sum(mvols[-5:]) / 5 > sum(mvols) / len(mvols))
 
     xings = state.get("vwap_crossings", 0)
     trend_score = mean_score = 0
@@ -794,9 +868,10 @@ def trap_trigger_engine(state: TrapXState) -> TrapXState:
         disp_pct = abs(fc["close"] - fp["close"]) / max(fp["close"], 1e-6) * 100
         fut_disp_ok = disp_pct >= CFG["futures_displacement_pct"]
         avg_fvol    = _rolling_vol_avg(G_FUT)
-        fut_vol_ok  = avg_fvol > 0 and fc.get("volume", 0) > CFG["futures_volume_mult"] * avg_fvol
+        min_vol     = _minute_vols(G_FUT[-2:])[-1]
+        fut_vol_ok  = avg_fvol > 0 and min_vol > CFG["futures_volume_mult"] * avg_fvol
         print(f"     FutDisp={disp_pct:.3f}%  ok={fut_disp_ok}  "
-              f"FutVol={fc.get('volume',0):,}  VolumeOk={fut_vol_ok}")
+              f"FutVol/min={min_vol:,.0f}  avg={avg_fvol:,.0f}  VolumeOk={fut_vol_ok}")
 
     opt_score, ladder_table = 0, []
     if len(G_SIG) >= 2:
@@ -890,6 +965,15 @@ def trade_lifecycle_manager(state: TrapXState) -> TrapXState:
         entry_p   = entry.get("entry_price", cur["close"])
         stop_p    = entry.get("stop_price",  cur["close"])
 
+        if _parse_time(bar_time) >= CFG["eod_squareoff"]:
+            pnl = cur["close"] - entry_p if direction == "UP" else entry_p - cur["close"]
+            tlog.append(dict(bar_time=bar_time, trigger_time=trigger_time, action="EOD_EXIT",
+                             price=cur["close"], pnl_pts=round(pnl, 2), reason="15:15 square-off"))
+            print(f"     ⏱️  EOD EXIT @ {cur['close']:.2f}  pnl={pnl:+.1f}")
+            state.update(trade_state="IDLE", trade_entry=None, candles_in_trade=0)
+            state["trade_log"] = tlog
+            return state
+
         if n >= CFG["time_stop_candles"]:
             favorable = ((direction == "UP" and cur["close"] > entry_p) or
                          (direction == "DOWN" and cur["close"] < entry_p))
@@ -915,7 +999,7 @@ def trade_lifecycle_manager(state: TrapXState) -> TrapXState:
 
     elif tstate == "IDLE":
         sig = state.get("trade_signal")
-        if sig:
+        if sig and _parse_time(bar_time) < CFG["no_new_entries_after"]:
             state.update(trade_state="IN_TRADE", trade_entry=sig, candles_in_trade=0)
             tlog.append(dict(bar_time=bar_time, trigger_time=trigger_time,
                              action="ENTRY", direction=sig["direction"],
@@ -947,30 +1031,109 @@ def minute_summary(state: TrapXState) -> TrapXState:
     return state
 
 
+def _wf_ignore_pos_for_put(sig: Dict) -> bool:
+    """Mirror of _wf_ignore_neg_for_call: a bullish options signal is IGNORED
+    for a PUT when OTM call writers are building or puts are being squeezed."""
+    otm_ce_positive = float(sig.get("otm_call_sentiments_sum", 0)) > 0
+    pe_squeeze      = (float(sig.get("itm_put_sentiments_sum", 0)) < 0 and
+                       float(sig.get("otm_put_sentiments_sum", 0)) > 0)
+    return otm_ce_positive or pe_squeeze
+
+
+def _bars_between(t0: str, t1: str) -> int:
+    """Minutes from 'HH:MM' t0 to t1."""
+    a, b = _parse_time(t0), _parse_time(t1)
+    return (b.hour * 60 + b.minute) - (a.hour * 60 + a.minute)
+
+
+def _propose(state: TrapXState, cands: List[Dict], strategy: str, action: str,
+             direction: str, entry: float, stop: float, trap_ok: bool, **extra):
+    """Queue a setup for the conviction gate. Strategies never open positions
+    themselves any more – every trade is scored first (Promise 3)."""
+    cands.append(dict(strategy=strategy, action=action, direction=direction,
+                      entry=round(float(entry), 2), stop=round(float(stop), 2),
+                      trap_ok=bool(trap_ok), bar_time=state.get("bar_time"),
+                      trigger_time=state.get("trigger_time"), **extra))
+    print(f"     WF {strategy} ?? PROPOSE {direction} @ {entry:.2f}  stop={stop:.2f}  "
+          f"trap_ok={bool(trap_ok)}  → conviction gate")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NODE BV – breakout_validator  (Promise 1)
+#   Every PDH / PDL break starts PENDING ("don't chase"), then resolves:
+#     FAKE  close reclaims the level by ≥ 0.5×EM inside the validation window
+#     REAL  N consecutive closes beyond, or an extension of ≥ 3×EM that holds,
+#           or no reclaim before the window ends
+#   A FAKE level re-arms, so a second break is validated again.
+# ─────────────────────────────────────────────────────────────────────────────
+def breakout_validator(state: TrapXState) -> TrapXState:
+    if not G_SPOT or not G_PDC:
+        return state
+    bar_time     = state.get("bar_time", "??:??")
+    trigger_time = state.get("trigger_time", "??:??")
+    idx, cur     = state.get("bar_index", 0), G_SPOT[-1]
+    em           = float(state.get("expected_move_1min", 11.0))
+    bo           = {k: dict(v) for k, v in (state.get("bo_state") or {}).items()}
+    elog         = list(state.get("exec_log", []))
+    printed      = False
+
+    def emit(kind, lvl, msg, **kw):
+        nonlocal printed
+        if not printed:
+            print(f"\n  🧪  BREAKOUT VALIDATOR  [{_fmt(bar_time, trigger_time)}]")
+            printed = True
+        elog.append(dict(type="BREAKOUT", action=f"{lvl}_{kind}", level=lvl,
+                         bar_time=bar_time, trigger_time=trigger_time, note=msg, **kw))
+        print(f"     BO {lvl} {kind:<8} {msg}")
+
+    for lvl, price, side in (("PDH", G_PDC["prev_day_high"], +1),
+                             ("PDL", G_PDC["prev_day_low"],  -1)):
+        b = bo.get(lvl) or dict(status="NONE", breaks=0)
+        pierced = cur["high"] > price if side > 0 else cur["low"] < price
+        beyond  = (cur["close"] - price) * side            # >0 → closed beyond level
+
+        can_arm = b["status"] == "NONE" or (b["status"] == "FAKE" and idx - b["resolved_idx"] >= 3)
+        if can_arm and pierced:
+            b.update(status="PENDING", break_bar=bar_time, break_idx=idx, hold=0,
+                     extreme=cur["high"] if side > 0 else cur["low"], breaks=b["breaks"] + 1)
+            emit("BREAK", lvl, f"{lvl} {price:.2f} broken — validating, don't chase",
+                 price=round(price, 2))
+
+        if b["status"] == "PENDING":
+            b["extreme"] = max(b["extreme"], cur["high"]) if side > 0 else min(b["extreme"], cur["low"])
+            b["hold"]    = b["hold"] + 1 if beyond > 0 else 0
+            ext          = (b["extreme"] - price) * side
+            age          = idx - b["break_idx"]
+            if -beyond >= CFG["bo_reclaim_em"] * em:
+                b.update(status="FAKE", resolved_bar=bar_time, resolved_idx=idx)
+                emit("FAKE", lvl, f"trap: reclaimed {lvl} after {age} bar(s), "
+                                  f"max excursion {ext:.1f} pts — snap-back setups armed",
+                     price=round(cur["close"], 2), excursion=round(ext, 2))
+            elif (b["hold"] >= CFG["bo_real_hold_bars"]
+                  or (ext >= CFG["bo_real_extension_em"] * em and beyond > 0)
+                  or age >= CFG["bo_fake_window"]):
+                b.update(status="REAL", resolved_bar=bar_time, resolved_idx=idx)
+                emit("REAL", lvl, f"accepted beyond {lvl}: {b['hold']} closes beyond, "
+                                  f"extension {ext:.1f} pts — no trap trade",
+                     price=round(cur["close"], 2), excursion=round(ext, 2))
+        bo[lvl] = b
+
+    state["bo_state"] = bo
+    state["exec_log"] = elog
+    return state
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # NODE WF – workflow_strategy_engine
 #
-#  Implements the 4 strategies from WorkFlow Enhancements.xlsx:
+#  Proposes setups from WorkFlow Enhancements.xlsx (+ S5, the PDH mirror of S1):
 #    S1  Bounce PDL Break         → Initial CALL
-#        • PDL broken → first UP LIS > 2× EM confirms bottom
-#        • Next bar holds support above LIS open → CALL entry
-#        • Ignore bearish signal when OTM PE positive / CE squeeze / otm_support
-#
-#    S2  LIS High Retracement     → Pyramid CALL (add to existing CALL)
-#        • In CALL, price retraces and low touches a prior UP-LIS high
-#        • Cooldown: ≥ 10 min since last pyramid; only post-entry LIS legs counted
-#        • Ignore bearish signal (same filter as S1)
-#
-#    S3  Top Trade Less SL        → Initial PUT  (only after 12:30)
-#        • 2+ upper-wick rejections near intraday high
-#        • Negative signal + strong ITM PE selling (itm_put < -2)
-#        • Closes any open CALL and enters PUT with tight SL above day high
-#
-#    S4  Fibo Retracement Bottom  → Initial CALL (only after 12:30)
-#        • Fib 50% computed from LIS-bottom low to morning peak (before 12:30)
-#        • Current bar low within 2× EM of fib 50%
-#        • Recent UP LIS (≤ 4 bars ago) + CE squeeze OR otm_support > 0
-#        • Closes any open PUT and enters CALL
+#    S2  LIS High Retracement     → Pyramid CALL (prior post-entry LIS high only)
+#    S3  Top Trade Less SL        → Initial PUT  (after 12:30)
+#    S4  Fibo Retracement Bottom  → Initial CALL (after 12:30)
+#    S5  Fake PDH Break           → Initial PUT
+#  Nothing is executed here: candidates go to conviction_gate, then
+#  position_manager sizes and fills them.
 # ─────────────────────────────────────────────────────────────────────────────
 def workflow_strategy_engine(state: TrapXState) -> TrapXState:
     if not G_SPOT or not G_PDC:
@@ -980,284 +1143,436 @@ def workflow_strategy_engine(state: TrapXState) -> TrapXState:
     trigger_time = state.get("trigger_time", "??:??")
     cur          = G_SPOT[-1]
     em           = float(state.get("expected_move_1min", 11.0))
-    sig          = G_SIG[-1]           if G_SIG             else {}
-    prev_sig     = G_SIG[-2]           if len(G_SIG) >= 2   else {}
+    sig          = G_SIG[-1] if G_SIG else {}
 
     print(f"\n  📋  WORKFLOW STRATEGIES  [{_fmt(bar_time, trigger_time)}]")
 
     wf_pos        = state.get("wf_position",      "IDLE")
     wf_pdl_break  = state.get("wf_pdl_break_bar", "")
+    wf_pdh_break  = state.get("wf_pdh_break_bar", "")
     wf_lis_bottom = state.get("wf_lis_bottom",    None)
-    pdl           = G_PDC.get("prev_day_low", 0.0)
+    wf_lis_top    = state.get("wf_lis_top",       None)
+    fired         = state.get("wf_fired", []) or []
+    bo            = state.get("bo_state", {}) or {}
+    pdl, pdh      = G_PDC.get("prev_day_low", 0.0), G_PDC.get("prev_day_high", 0.0)
     bar_t         = _parse_time(bar_time)
+    big_lis       = state.get("big_lis_legs", [])
+    new_lis       = big_lis[0] if big_lis and big_lis[0].get("ts") == bar_time else None
+    cands: List[Dict] = []
 
-    # ── Track PDL break (first bar whose low goes under prev-day low) ─────────
+    # ── Track PDL / PDH breaks (first bar beyond each level) ─────────────────
     if not wf_pdl_break and cur["low"] < pdl:
-        wf_pdl_break              = bar_time
-        state["wf_pdl_break_bar"] = bar_time
-        print(f"     WF-PDL: PDL BROKEN @ {bar_time}  "
-              f"low={cur['low']:.2f} < PDL={pdl:.2f}")
+        wf_pdl_break = state["wf_pdl_break_bar"] = bar_time
+        print(f"     WF-PDL: PDL BROKEN @ {bar_time}  low={cur['low']:.2f} < PDL={pdl:.2f}")
+    if not wf_pdh_break and cur["high"] > pdh:
+        wf_pdh_break = state["wf_pdh_break_bar"] = bar_time
+        print(f"     WF-PDH: PDH BROKEN @ {bar_time}  high={cur['high']:.2f} > PDH={pdh:.2f}")
 
-    # ── Track first UP LIS after PDL break (LIS body > 2× expected move) ─────
-    if wf_pdl_break and not wf_lis_bottom:
-        big_lis = state.get("big_lis_legs", [])
-        if (big_lis
-                and big_lis[0].get("ts") == bar_time
-                and big_lis[0].get("direction") == "UP"
-                and big_lis[0]["body"] > 2 * em):
-            wf_lis_bottom = dict(
-                ts    = bar_time,
-                open  = cur["open"],
-                high  = cur["high"],
-                low   = cur["low"],
-                close = cur["close"],
-                body  = big_lis[0]["body"],
-            )
-            state["wf_lis_bottom"] = wf_lis_bottom
-            print(f"     WF-LIS: LIS BOTTOM confirmed @ {bar_time}  "
-                  f"body={big_lis[0]['body']:+.2f} pts  (> 2x EM={em:.2f})")
+    # ── First UP LIS after PDL break / first DOWN LIS after PDH break ────────
+    if wf_pdl_break and not wf_lis_bottom and new_lis \
+            and new_lis["direction"] == "UP" and new_lis["body"] > 2 * em:
+        wf_lis_bottom = state["wf_lis_bottom"] = dict(
+            ts=bar_time, open=cur["open"], high=cur["high"], low=cur["low"],
+            close=cur["close"], body=new_lis["body"])
+        print(f"     WF-LIS: LIS BOTTOM confirmed @ {bar_time}  "
+              f"body={new_lis['body']:+.2f} pts  (> 2x EM={em:.2f})")
+    if wf_pdh_break and not wf_lis_top and new_lis \
+            and new_lis["direction"] == "DOWN" and new_lis["body"] < -2 * em:
+        wf_lis_top = state["wf_lis_top"] = dict(
+            ts=bar_time, open=cur["open"], high=cur["high"], low=cur["low"],
+            close=cur["close"], body=new_lis["body"])
+        print(f"     WF-LIS: LIS TOP confirmed @ {bar_time}  "
+              f"body={new_lis['body']:+.2f} pts  (< -2x EM={em:.2f})")
 
     # ── Track morning peak: max high from LIS bottom until 12:30 ─────────────
     if wf_lis_bottom and bar_t < dtime(12, 30):
-        curr_peak = float(state.get("wf_morning_peak_h", 0.0))
-        if cur["high"] > curr_peak:
+        if cur["high"] > float(state.get("wf_morning_peak_h", 0.0)):
             state["wf_morning_peak_h"]   = round(cur["high"], 2)
             state["wf_morning_peak_bar"] = bar_time
 
-    # ═════════════════════════════════════════════════════════════════════════
-    # S1 – Bounce PDL Break → Initial CALL
-    # Entry bar = FIRST bar after LIS-bottom that holds support above LIS open
-    # ═════════════════════════════════════════════════════════════════════════
-    if (wf_lis_bottom is not None
-            and wf_pos == "IDLE"
-            and bar_time != wf_lis_bottom["ts"]):
-
-        lis_open   = float(wf_lis_bottom["open"])
-        support_ok = cur["low"] > lis_open * 0.999   # within 0.1% of LIS open
-
-        if support_ok:
-            sig_neg = _wf_sig_negative(sig)
-            proceed = (not sig_neg) or _wf_ignore_neg_for_call(sig)
-
-            if proceed:
-                entry_p = round(cur["close"], 2)
-                stop_p  = round(wf_lis_bottom["low"] - em, 2)
-                state["wf_position"]     = "CALL"
-                state["wf_pyramid_done"] = False
-                state["wf_entry"] = dict(
-                    strategy    = "S1_Bounce_PDL_Break",
-                    direction   = "CALL",
-                    entry_bar   = bar_time,
-                    entry_price = entry_p,
-                    stop_price  = stop_p,
-                )
-                wf_tlog = list(state.get("wf_trade_log", []))
-                ignored = sig_neg and _wf_ignore_neg_for_call(sig)
-                wf_tlog.append(dict(
-                    bar_time     = bar_time,
-                    trigger_time = trigger_time,
-                    action       = "S1_INITIAL_CALL",
-                    price        = entry_p,
-                    stop         = stop_p,
-                    sig_neg      = sig_neg,
-                    ignored      = ignored,
-                ))
-                state["wf_trade_log"] = wf_tlog
-                tag = " [neg sig IGNORED - OTM PE / CE squeeze]" if ignored else ""
-                print(f"     WF S1 >> INITIAL CALL @ {entry_p:.2f}  "
-                      f"Stop={stop_p:.2f}{tag}")
-                wf_pos = "CALL"
-
-    # ═════════════════════════════════════════════════════════════════════════
-    # S2 – LIS High Retracement → Pyramid CALL
-    # Price retraces and current bar's LOW touches a prior UP-LIS candle HIGH
-    # ═════════════════════════════════════════════════════════════════════════
-    if (wf_lis_bottom is not None
-            and wf_pos == "CALL"
-            and not state.get("wf_pyramid_done", False)):
-
-        tol         = em * 1.5
-        entry_bar   = state.get("wf_entry", {}).get("entry_bar", "")
-        big_lis     = state.get("big_lis_legs", [])
-
-        # Only UP LIS legs that formed AFTER initial CALL entry
-        post_entry_up = [
-            leg for leg in big_lis
-            if leg.get("direction") == "UP" and leg.get("ts", "") > entry_bar
-        ]
-
-        near_lis_high = False
-        ref_ts        = ""
-        for leg in post_entry_up:
-            spot_b = _spot_bar_by_ts(leg["ts"])
-            if spot_b is not None:
-                lis_h = float(spot_b["high"])
-                if abs(cur["low"] - lis_h) <= tol:
-                    near_lis_high = True
-                    ref_ts        = leg["ts"]
-                    break
-
-        if near_lis_high:
-            sig_neg = _wf_sig_negative(sig)
-            proceed = (not sig_neg) or _wf_ignore_neg_for_call(sig)
-
-            # Cooldown: at least 10 minutes since last pyramid
-            last_pyr    = state.get("wf_last_pyramid_bar", "")
-            cooldown_ok = True
-            if last_pyr:
-                try:
-                    dt1 = dt.strptime(bar_time, "%H:%M")
-                    dt2 = dt.strptime(last_pyr,  "%H:%M")
-                    cooldown_ok = abs((dt1 - dt2).seconds // 60) >= 10
-                except Exception:
-                    pass
-
-            if proceed and cooldown_ok:
-                state["wf_pyramid_done"]     = True
-                state["wf_last_pyramid_bar"] = bar_time
-                wf_tlog = list(state.get("wf_trade_log", []))
-                ignored = sig_neg and _wf_ignore_neg_for_call(sig)
-                wf_tlog.append(dict(
-                    bar_time     = bar_time,
-                    trigger_time = trigger_time,
-                    action       = "S2_PYRAMID_CALL",
-                    price        = round(cur["close"], 2),
-                    ref_lis_ts   = ref_ts,
-                    sig_neg      = sig_neg,
-                    ignored      = ignored,
-                ))
-                state["wf_trade_log"] = wf_tlog
-                tag = " [neg sig IGNORED]" if ignored else ""
-                print(f"     WF S2 >> PYRAMID CALL @ {cur['close']:.2f}  "
-                      f"(prior LIS high @ {ref_ts}){tag}")
-
-    # ═════════════════════════════════════════════════════════════════════════
-    # S3 – Top Trade Less SL → Initial PUT   (time-gated: after 12:30)
-    # Requires 2+ upper-wick rejections near intraday high, then neg signal
-    # with strong ITM PE selling.
-    # ═════════════════════════════════════════════════════════════════════════
-    if wf_pos in ("IDLE", "CALL") and bar_t >= dtime(12, 30):
-
-        # Accumulate wick rejections near the intraday high
-        wick     = cur["high"] - max(cur["open"], cur["close"])
-        rng      = cur["high"] - cur["low"]
-        id_high  = float(state.get("intraday_high", 0.0))
-        near_top = (id_high - cur["high"]) < em
-
-        if rng > 0.5 and (wick / rng) > 0.40 and near_top:
-            rej = state.get("wf_wick_rejections", 0) + 1
-            state["wf_wick_rejections"] = rej
+    # ── S3 bookkeeping: wick rejections near the high (after 12:30) ──────────
+    if bar_t >= dtime(12, 30):
+        wick    = cur["high"] - max(cur["open"], cur["close"])
+        rng     = cur["high"] - cur["low"]
+        id_high = float(state.get("intraday_high", 0.0))
+        if rng > 0.5 and (wick / rng) > 0.40 and (id_high - cur["high"]) < em:
+            state["wf_wick_rejections"] = state.get("wf_wick_rejections", 0) + 1
             state["wf_last_wick_bar"]   = bar_time
-            print(f"     WF S3: Upper-wick rejection #{rej} @ {bar_time}  "
+            print(f"     WF S3: Upper-wick rejection #{state['wf_wick_rejections']} @ {bar_time}  "
                   f"wick={wick:.2f} ({wick/rng:.0%} of range)")
 
-        rej_count = state.get("wf_wick_rejections", 0)
-        if rej_count >= 2:
-            sig_neg   = _wf_sig_negative(sig)
-            pe_squeeze = float(sig.get("itm_put_sentiments_sum", 0)) < -2.0
+    accepting = bar_t < CFG["no_new_entries_after"] and not state.get("kill_switch", False)
+    if not accepting:
+        state["wf_candidates"] = []
+        return state
 
-            if sig_neg and pe_squeeze:
-                entry_p = round(cur["close"], 2)
-                stop_p  = round(id_high + em * 0.5, 2)
+    # S1 – Bounce PDL Break → Initial CALL
+    if (wf_lis_bottom and wf_pos == "IDLE" and "S1" not in fired
+            and bar_time != wf_lis_bottom["ts"]
+            and _bars_between(wf_lis_bottom["ts"], bar_time) <= CFG["s_entry_valid_bars"]
+            and cur["low"] > float(wf_lis_bottom["open"]) * 0.999):
+        sig_neg = _wf_sig_negative(sig)
+        ignored = sig_neg and _wf_ignore_neg_for_call(sig)
+        if not sig_neg or ignored:
+            _propose(state, cands, "S1", "S1_INITIAL_CALL", "CALL", cur["close"],
+                     wf_lis_bottom["low"] - em,
+                     trap_ok=bo.get("PDL", {}).get("status") == "FAKE",
+                     sig_neg=sig_neg, ignored=ignored, lis_ts=wf_lis_bottom["ts"])
 
-                if wf_pos == "CALL":
-                    print(f"     WF S3: Closing existing CALL -> pivoting to PUT")
-                state["wf_position"]        = "PUT"
-                state["wf_pyramid_done"]    = False
-                state["wf_wick_rejections"] = 0   # reset for next S3 cycle
-                state["wf_entry"] = dict(
-                    strategy    = "S3_Top_Trade_Less_SL",
-                    direction   = "PUT",
-                    entry_bar   = bar_time,
-                    entry_price = entry_p,
-                    stop_price  = stop_p,
-                )
-                wf_tlog = list(state.get("wf_trade_log", []))
-                wf_tlog.append(dict(
-                    bar_time     = bar_time,
-                    trigger_time = trigger_time,
-                    action       = "S3_INITIAL_PUT",
-                    price        = entry_p,
-                    stop         = stop_p,
-                    rej_count    = rej_count,
-                ))
-                state["wf_trade_log"] = wf_tlog
-                print(f"     WF S3 >> INITIAL PUT @ {entry_p:.2f}  "
-                      f"Stop={stop_p:.2f}  "
-                      f"({rej_count} wick rejections + PE squeeze)")
-                wf_pos = "PUT"
+    # S5 – Fake PDH Break → Initial PUT  (mirror of S1)
+    if (wf_lis_top and wf_pos == "IDLE" and "S5" not in fired
+            and bar_time != wf_lis_top["ts"]
+            and _bars_between(wf_lis_top["ts"], bar_time) <= CFG["s_entry_valid_bars"]
+            and cur["high"] < float(wf_lis_top["open"]) * 1.001):
+        sig_pos = float(sig.get("final_signal_value", 0)) > 0
+        ignored = sig_pos and _wf_ignore_pos_for_put(sig)
+        if not sig_pos or ignored:
+            _propose(state, cands, "S5", "S5_INITIAL_PUT", "PUT", cur["close"],
+                     wf_lis_top["high"] + em,
+                     trap_ok=bo.get("PDH", {}).get("status") == "FAKE",
+                     sig_pos=sig_pos, ignored=ignored, lis_ts=wf_lis_top["ts"])
 
-    # ═════════════════════════════════════════════════════════════════════════
-    # S4 – Fibo Retracement Bottom → Initial CALL  (time-gated: after 12:30)
-    # Fib 50% from LIS-bottom low to morning peak; current bar tests that level
-    # with a recent UP LIS and CE-squeeze / OTM-support confirmation.
-    # ═════════════════════════════════════════════════════════════════════════
-    if (wf_lis_bottom is not None
-            and wf_pos in ("IDLE", "PUT")
-            and bar_t >= dtime(12, 30)):
+    # S2 – LIS High Retracement → Pyramid CALL (retest of a PRIOR post-entry LIS high)
+    if wf_lis_bottom and wf_pos == "CALL" and not state.get("wf_pyramid_done", False):
+        entry_bar = (state.get("wf_entry") or {}).get("entry_bar", "")
+        for leg in big_lis:
+            if not (leg.get("direction") == "UP" and entry_bar < leg.get("ts", "") < bar_time):
+                continue
+            spot_b = _spot_bar_by_ts(leg["ts"])
+            if spot_b is None or abs(cur["low"] - float(spot_b["high"])) > em * 1.5:
+                continue
+            last_pyr = state.get("wf_last_pyramid_bar", "")
+            if last_pyr and _bars_between(last_pyr, bar_time) < 10:
+                break
+            sig_neg = _wf_sig_negative(sig)
+            ignored = sig_neg and _wf_ignore_neg_for_call(sig)
+            if not sig_neg or ignored:
+                pos_stop = (state.get("pos") or {}).get("stop", cur["low"] - em)
+                _propose(state, cands, "S2", "S2_PYRAMID_CALL", "CALL", cur["close"], pos_stop,
+                         trap_ok=cur["close"] > float(spot_b["high"]),
+                         ref_lis_ts=leg["ts"], sig_neg=sig_neg, ignored=ignored)
+            break
 
-        # Compute Fibonacci 50% level once (locked after first calculation)
+    # S3 – Top Trade Less SL → Initial PUT (after 12:30)
+    if (wf_pos in ("IDLE", "CALL") and "S3" not in fired and bar_t >= dtime(12, 30)
+            and state.get("wf_wick_rejections", 0) >= 2
+            and _wf_sig_negative(sig) and float(sig.get("itm_put_sentiments_sum", 0)) < -2.0):
+        id_high = float(state.get("intraday_high", 0.0))
+        _propose(state, cands, "S3", "S3_INITIAL_PUT", "PUT", cur["close"], id_high + em * 0.5,
+                 trap_ok=True, rej_count=state.get("wf_wick_rejections", 0))
+
+    # S4 – Fibo Retracement Bottom → Initial CALL (after 12:30)
+    if wf_lis_bottom and wf_pos in ("IDLE", "PUT") and "S4" not in fired and bar_t >= dtime(12, 30):
         if not state.get("wf_fib_computed", False):
             swing_low  = float(wf_lis_bottom["low"])
             swing_high = float(state.get("wf_morning_peak_h", 0.0))
             if swing_high > swing_low + em * 5:
-                fib_50 = swing_low + 0.5 * (swing_high - swing_low)
-                state["wf_fib_50"]       = round(fib_50, 2)
+                state["wf_fib_50"]       = round(swing_low + 0.5 * (swing_high - swing_low), 2)
                 state["wf_fib_computed"] = True
-                print(f"     WF S4: Fib levels  "
-                      f"swing_low={swing_low:.2f}  "
-                      f"swing_high={swing_high:.2f}  "
-                      f"50%={fib_50:.2f}")
-
-        fib_50   = float(state.get("wf_fib_50", 0.0))
-        tol      = em * 2.0
-        near_fib = fib_50 > 0 and abs(cur["low"] - fib_50) <= tol
-
-        if near_fib:
-            big_lis  = state.get("big_lis_legs", [])
-            # UP LIS formed in the last 4 minutes
-            cutoff   = (dt.strptime(bar_time, "%H:%M") - timedelta(minutes=4)).strftime("%H:%M")
-            recent_lis_up = any(
-                l.get("direction") == "UP" and l.get("ts", "") >= cutoff
-                for l in big_lis
-            )
-            ce_squeeze = _wf_ce_squeeze(sig)
-            otm_sup    = float(sig.get("otm_support", 0)) > 0
-
+                print(f"     WF S4: Fib levels  swing_low={swing_low:.2f}  "
+                      f"swing_high={swing_high:.2f}  50%={state['wf_fib_50']:.2f}")
+        fib_50 = float(state.get("wf_fib_50", 0.0))
+        if fib_50 > 0 and abs(cur["low"] - fib_50) <= em * 2.0:
+            cutoff = (dt.strptime(bar_time, "%H:%M") - timedelta(minutes=4)).strftime("%H:%M")
+            recent_lis_up = any(l.get("direction") == "UP" and l.get("ts", "") >= cutoff for l in big_lis)
+            ce_squeeze    = _wf_ce_squeeze(sig)
+            otm_sup       = float(sig.get("otm_support", 0)) > 0
             if recent_lis_up and (ce_squeeze or otm_sup):
-                entry_p = round(cur["close"], 2)
-                stop_p  = round(fib_50 - em, 2)
+                _propose(state, cands, "S4", "S4_INITIAL_CALL", "CALL", cur["close"], fib_50 - em,
+                         trap_ok=True, fib_50=fib_50, dist_to_fib=round(cur["low"] - fib_50, 2),
+                         confirmation="CE-squeeze" if ce_squeeze else "OTM-PE-support")
 
-                if wf_pos == "PUT":
-                    print(f"     WF S4: Closing existing PUT -> pivoting to CALL")
-                state["wf_position"]     = "CALL"
-                state["wf_pyramid_done"] = False
-                state["wf_entry"] = dict(
-                    strategy    = "S4_Fibo_Retracement_Bottom",
-                    direction   = "CALL",
-                    entry_bar   = bar_time,
-                    entry_price = entry_p,
-                    stop_price  = stop_p,
-                    fib_50      = fib_50,
-                )
-                wf_tlog = list(state.get("wf_trade_log", []))
-                conf_reason = "CE-squeeze" if ce_squeeze else "OTM-PE-support"
-                wf_tlog.append(dict(
-                    bar_time     = bar_time,
-                    trigger_time = trigger_time,
-                    action       = "S4_INITIAL_CALL",
-                    price        = entry_p,
-                    stop         = stop_p,
-                    fib_50       = fib_50,
-                    dist_to_fib  = round(cur["low"] - fib_50, 2),
-                    confirmation = conf_reason,
-                ))
-                state["wf_trade_log"] = wf_tlog
-                print(f"     WF S4 >> INITIAL CALL @ {entry_p:.2f}  "
-                      f"Stop={stop_p:.2f}  Fib50={fib_50:.2f}  "
-                      f"[{conf_reason} + recent LIS UP]")
-
+    state["wf_candidates"] = cands
     return state
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NODE CG – conviction_gate  (Promise 3)
+#   Scores every proposed setup with the six-factor model, measured over the
+#   setup window (a setup is multi-bar, so single-minute snapshots understate
+#   it). ≥ 80 → FULL size, 70–79 → HALF size, < 70 → skipped and logged.
+# ─────────────────────────────────────────────────────────────────────────────
+def _setup_score(state: TrapXState, direction: str, trap_ok: bool):
+    w, up = CFG["setup_window"], direction == "CALL"
+    d     = 1 if up else -1
+
+    disp = 0.0
+    if len(G_FUT) >= 2:      # early in the session the window shrinks to what exists
+        f0, f1 = G_FUT[max(0, len(G_FUT) - 1 - w)]["close"], G_FUT[-1]["close"]
+        disp = (f1 - f0) / max(f0, 1e-6) * 100 * d
+    disp_ok = disp >= CFG["futures_displacement_pct"]
+
+    ladder_ok, accel = False, 0.0
+    if len(G_SIG) >= 2:
+        ls, ps = G_SIG[-1], G_SIG[max(0, len(G_SIG) - 1 - w)]
+        levels = [("itm_call_sentiments_sum", "itm_put_sentiments_sum", 0.4),
+                  ("atm_call_sentiments_sum", "atm_put_sentiments_sum", 0.3),
+                  ("otm_call_sentiments_sum", "otm_put_sentiments_sum", 0.2),
+                  ("call_sentiments_sum",     "put_sentiments_sum",     0.1)]
+        cp = pp = 0
+        for cc, pc, wt in levels:
+            dc = float(ls.get(cc, 0)) - float(ps.get(cc, 0))
+            dp = float(ls.get(pc, 0)) - float(ps.get(pc, 0))
+            cp += int(dc * d > 0)
+            pp += int(dp * d < 0)
+            base = abs(float(ps.get(cc, 0)))
+            if base > 1e-6 and dc * d / base > 0.015:
+                accel += wt
+        ladder_ok = cp >= CFG["option_ladder_pass"] and pp >= CFG["option_ladder_pass"]
+
+    mv     = _minute_vols(G_FUT)
+    recent = mv[-w:]
+    prior  = mv[-(w + 20):-w][1:] if len(mv) > w + 2 else []
+    vol_ok = bool(prior) and (sum(recent) / len(recent)) > CFG["futures_volume_mult"] * (sum(prior) / len(prior))
+
+    regime = state.get("regime", "UNDEFINED")
+    close, twap = G_SPOT[-1]["close"], state.get("running_twap", 0.0)
+    legs   = [l for l in state.get("impulse_legs", []) if l.get("active")]
+    regime_ok = (regime == "MEAN" or
+                 (regime == "TREND" and ((close - twap) * d > 0 or
+                                         any(l["direction"] == ("UP" if up else "DOWN") for l in legs))))
+
+    score, detail = 0, {}
+    for key, ok, weight, partial in (
+            ("Futures Displacement", disp_ok,   CFG["weight_futures_displacement"], 1.0),
+            ("Option Ladder",        ladder_ok, CFG["weight_option_ladder"],        1.0),
+            ("Volume Expansion",     vol_ok,    CFG["weight_volume_expansion"],     1.0),
+            ("Delta Acceleration",   accel > 0, CFG["weight_delta_acceleration"],   min(accel / 0.5, 1.0)),
+            ("Trap Structure",       trap_ok,   CFG["weight_trap_structure"],       1.0),
+            ("Regime Alignment",     regime_ok, CFG["weight_regime_alignment"],     1.0)):
+        score += int(weight * partial) if ok else 0
+        detail[key] = bool(ok)
+    return min(score, 100), detail, round(disp, 3)
+
+
+def conviction_gate(state: TrapXState) -> TrapXState:
+    cands = state.get("wf_candidates") or []
+    state["gate_decisions"], state["wf_approved"] = [], None
+    if not cands:
+        return state
+
+    bar_time, trigger_time = state.get("bar_time", "??:??"), state.get("trigger_time", "??:??")
+    idx       = state.get("bar_index", 0)
+    elog      = list(state.get("exec_log", []))
+    last_skip = dict(state.get("gate_last_skip", {}))
+    print(f"\n  ⚖️   CONVICTION GATE  [{_fmt(bar_time, trigger_time)}]")
+
+    decisions, approved = [], None
+    for c in cands:
+        score, detail, disp = _setup_score(state, c["direction"], c["trap_ok"])
+        tier = ("FULL" if score >= CFG["gate_full_score"]
+                else "HALF" if score >= CFG["conviction_threshold"] else None)
+        dec = dict(c, score=score, checklist=detail, tier=tier, fut_disp_pct=disp)
+        decisions.append(dec)
+        ticks = " ".join(f"{'✔' if ok else '✘'}{k.split()[0]}" for k, ok in detail.items())
+        print(f"     {c['strategy']} {c['direction']}  score={score}/100  "
+              f"{'→ ' + tier if tier else '→ SKIP (< ' + str(CFG['conviction_threshold']) + ')'}  [{ticks}]")
+        if tier and approved is None:
+            approved = dec
+        elif not tier and idx - last_skip.get(c["strategy"], -10**6) >= CFG["gate_skip_log_every"]:
+            last_skip[c["strategy"]] = idx
+            elog.append(dict(dec, type="SKIP", action=f"{c['strategy']}_SKIPPED",
+                             note=f"conviction {score}/100 below {CFG['conviction_threshold']}"))
+
+    state["gate_decisions"] = decisions
+    state["wf_approved"]    = approved
+    state["gate_last_skip"] = last_skip
+    state["exec_log"]       = elog
+    return state
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NODE PM – position_manager  (Promises 7 & 9)
+#   Manages the open workflow position every bar — stop (gap-aware), target,
+#   trailing stop after +1R, 15:15 square-off — marks equity to market,
+#   enforces the daily-loss kill switch, then fills the approved setup with
+#   risk-based sizing. P&L is in index points × lot size (a delta-1 proxy:
+#   option premium, theta and IV are not modelled).
+# ─────────────────────────────────────────────────────────────────────────────
+def _close_position(state: TrapXState, pos: Dict, price: float, reason: str, elog: List[Dict]):
+    d    = 1 if pos["direction"] == "CALL" else -1
+    pts  = (price - pos["avg"]) * d
+    inr  = pts * pos["lots"] * CFG["lot_size"]
+    state["realized_pnl"] = float(state.get("realized_pnl", 0.0)) + inr
+    elog.append(dict(type="EXIT", action=f"EXIT_{reason}", strategy=pos["strategy"],
+                     direction=pos["direction"], bar_time=state.get("bar_time"),
+                     trigger_time=state.get("trigger_time"), price=round(price, 2),
+                     entry=round(pos["avg"], 2), lots=pos["lots"], pnl_pts=round(pts, 2),
+                     pnl_inr=round(inr), r_multiple=round(pts / pos["R"], 2) if pos["R"] else 0.0,
+                     reason=reason))
+    print(f"     💼 EXIT {reason:<8} {pos['strategy']} {pos['direction']} @ {price:.2f}  "
+          f"{pts:+.2f} pts × {pos['lots']} lot(s) = ₹{inr:+,.0f}")
+
+
+def position_manager(state: TrapXState) -> TrapXState:
+    if not G_SPOT:
+        return state
+    bar_time, trigger_time = state.get("bar_time", "??:??"), state.get("trigger_time", "??:??")
+    cur   = G_SPOT[-1]
+    em    = float(state.get("expected_move_1min", 11.0))
+    bar_t = _parse_time(bar_time)
+    lot   = CFG["lot_size"]
+    elog  = list(state.get("exec_log", []))
+    pos   = dict(state["pos"]) if state.get("pos") else None
+    n0    = len(elog)
+
+    # 1 · manage the open position
+    if pos:
+        d = 1 if pos["direction"] == "CALL" else -1
+        stop_hit = cur["low"] <= pos["stop"] if d > 0 else cur["high"] >= pos["stop"]
+        tgt_hit  = cur["high"] >= pos["target"] if d > 0 else cur["low"] <= pos["target"]
+        if stop_hit:   # worst case first when both touch in one bar; gap → fill at open
+            gapped = (cur["open"] - pos["stop"]) * d < 0
+            _close_position(state, pos, cur["open"] if gapped else pos["stop"],
+                            "TRAIL" if pos["trailing"] else "STOP", elog)
+            pos = None
+        elif tgt_hit:
+            _close_position(state, pos, pos["target"], "TARGET", elog)
+            pos = None
+        elif bar_t >= CFG["eod_squareoff"]:
+            _close_position(state, pos, cur["close"], "EOD", elog)
+            pos = None
+        else:
+            pos["peak"] = max(pos["peak"], cur["high"]) if d > 0 else min(pos["peak"], cur["low"])
+            if (pos["peak"] - pos["entry"]) * d >= CFG["trail_after_r"] * pos["R"]:
+                trail = pos["peak"] - d * CFG["trail_em_mult"] * em
+                trail = max(trail, pos["entry"]) if d > 0 else min(trail, pos["entry"])
+                if (trail - pos["stop"]) * d > 0:
+                    if not pos["trailing"]:
+                        print(f"     💼 TRAIL armed — stop {pos['stop']:.2f} → {trail:.2f}")
+                    pos["stop"], pos["trailing"] = round(trail, 2), True
+
+    # 2 · mark to market, drawdown, kill switch
+    def mark():
+        unreal = ((cur["close"] - pos["avg"]) * (1 if pos["direction"] == "CALL" else -1)
+                  * pos["lots"] * lot) if pos else 0.0
+        return CFG["capital"] + float(state.get("realized_pnl", 0.0)) + unreal
+
+    equity = mark()
+    if (not state.get("kill_switch") and
+            (CFG["capital"] - equity) / CFG["capital"] * 100 >= CFG["max_daily_loss_pct"]):
+        state["kill_switch"] = True
+        if pos:
+            _close_position(state, pos, cur["close"], "KILL", elog)
+            pos = None
+        elog.append(dict(type="RISK", action="KILL_SWITCH", bar_time=bar_time, trigger_time=trigger_time,
+                         note=f"daily loss limit {CFG['max_daily_loss_pct']}% hit — flat for the day"))
+        print(f"     🛑 KILL SWITCH — daily loss ≥ {CFG['max_daily_loss_pct']}%, flat for the day")
+        equity = mark()
+
+    # 3 · fill the approved setup
+    appr = state.get("wf_approved")
+    if appr and not state.get("kill_switch") and bar_t < CFG["no_new_entries_after"]:
+        d = 1 if appr["direction"] == "CALL" else -1
+        if pos and pos["direction"] != appr["direction"]:
+            _close_position(state, pos, cur["close"], "REVERSAL", elog)
+            pos = None
+            equity = mark()
+        R       = abs(appr["entry"] - appr["stop"])
+        per_lot = R * lot
+        room    = equity - CFG["capital"] * (1 - CFG["max_daily_loss_pct"] / 100)
+        if appr["action"] == "S2_PYRAMID_CALL":
+            add = max(1, pos["base_lots"] // 2) if pos else 0
+            if pos and add * per_lot <= room:
+                pos["avg"]  = (pos["avg"] * pos["lots"] + appr["entry"] * add) / (pos["lots"] + add)
+                pos["lots"] += add
+                state["wf_pyramid_done"], state["wf_last_pyramid_bar"] = True, bar_time
+                elog.append(dict(appr, type="ENTRY", lots=add, price=appr["entry"],
+                                 note=f"pyramid +{add} lot(s) · avg {pos['avg']:.2f}"))
+                print(f"     💼 PYRAMID +{add} lot(s) @ {appr['entry']:.2f}  avg={pos['avg']:.2f}")
+        elif not pos:
+            budget = equity * CFG["risk_per_trade_pct"] / 100 * (1.0 if appr["tier"] == "FULL" else 0.5)
+            lots   = int(budget // per_lot) if per_lot > 0 else 0
+            if lots == 0 and per_lot <= equity * CFG["max_risk_per_trade_pct"] / 100:
+                lots = 1
+            lots = min(lots, int(room // per_lot) if per_lot > 0 else 0)
+            if lots <= 0:
+                elog.append(dict(appr, type="SKIP", action=f"{appr['strategy']}_RISK_SKIP",
+                                 note=f"1 lot risks ₹{per_lot:,.0f} ({per_lot / equity * 100:.2f}% "
+                                      f"of equity) — over the risk limit"))
+                print(f"     💼 SKIP {appr['strategy']} — risk per lot ₹{per_lot:,.0f} too large")
+            else:
+                target = appr["entry"] + d * R * CFG["target_r_multiple"]
+                pos = dict(strategy=appr["strategy"], action=appr["action"], direction=appr["direction"],
+                           entry=appr["entry"], avg=appr["entry"], stop=appr["stop"], init_stop=appr["stop"],
+                           target=round(target, 2), R=round(R, 2), lots=lots, base_lots=lots,
+                           peak=appr["entry"], trailing=False, opened_bar=bar_time,
+                           tier=appr["tier"], score=appr["score"])
+                state["wf_fired"] = list(state.get("wf_fired", [])) + [appr["strategy"]]
+                state["wf_pyramid_done"] = False
+                state["wf_entry"] = dict(strategy=appr["action"], direction=appr["direction"],
+                                         entry_bar=bar_time, entry_price=appr["entry"],
+                                         stop_price=appr["stop"])
+                risk_inr = per_lot * lots
+                elog.append(dict(appr, type="ENTRY", lots=lots, price=appr["entry"], target=pos["target"],
+                                 risk_inr=round(risk_inr),
+                                 note=f"{appr['tier']} size · {lots} lot(s) · risk ₹{risk_inr:,.0f} "
+                                      f"({risk_inr / equity * 100:.2f}%) · target {pos['target']:.2f}"))
+                wf_tlog = list(state.get("wf_trade_log", []))
+                wf_tlog.append({k: v for k, v in appr.items() if k not in ("checklist",)} |
+                               dict(price=appr["entry"], lots=lots))
+                state["wf_trade_log"] = wf_tlog
+                print(f"     💼 ENTRY {appr['strategy']} {appr['direction']} @ {appr['entry']:.2f}  "
+                      f"stop={appr['stop']:.2f}  target={pos['target']:.2f}  {lots} lot(s)  [{appr['tier']}]")
+        equity = mark()
+
+    peak = max(float(state.get("equity_peak", CFG["capital"])), equity)
+    state["equity"], state["equity_peak"] = round(equity, 2), round(peak, 2)
+    state["max_drawdown_pct"] = round(max(float(state.get("max_drawdown_pct", 0.0)),
+                                          (peak - equity) / peak * 100), 3)
+    state["pos"]         = pos
+    state["wf_position"] = pos["direction"] if pos else "IDLE"
+    state["exec_log"]    = elog
+    if len(elog) > n0 or pos:
+        print(f"\n  💰  POSITION  [{_fmt(bar_time, trigger_time)}]  "
+              f"{(pos['direction'] + ' ' + str(pos['lots']) + ' lot(s) stop ' + format(pos['stop'], '.2f')) if pos else 'FLAT'}  "
+              f"equity=₹{equity:,.0f}  maxDD={state['max_drawdown_pct']:.2f}%")
+    return state
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NODE AI – ai_analyst  (Promise 8)
+#   Submits a compact market brief to the LLM analyst every N bars and on every
+#   gate decision. Runs in a background thread — never blocks the bar — and
+#   attaches opinions as they arrive. Advisory only: it does not gate trades.
+# ─────────────────────────────────────────────────────────────────────────────
+G_AI = None   # trapx_ai.AIAnalyst, created by run_replay
+
+
+def ai_analyst(state: TrapXState) -> TrapXState:
+    if G_AI is None or not G_AI.enabled:
+        return state
+    idx      = state.get("bar_index", 0)
+    bar_time = state.get("bar_time", "??:??")
+    if (idx > 0 and idx % CFG["ai_every_bars"] == 0) or state.get("gate_decisions"):
+        G_AI.submit(bar_time, _ai_brief(state))
+    new = G_AI.drain()
+    if new:
+        state["ai_opinions"] = list(state.get("ai_opinions", [])) + new
+        for o in new:
+            print(f"\n  🤖  AI ANALYST  [for bar {o['bar_time']}]  {o['verdict']}  "
+                  f"conf={o['confidence']:.2f}  {o['reasoning'][:140]}")
+    return state
+
+
+def _ai_brief(state: TrapXState) -> Dict:
+    bars = [dict(t=pd.Timestamp(b["timestamp"]).strftime("%H:%M"), o=round(b["open"], 1),
+                 h=round(b["high"], 1), l=round(b["low"], 1), c=round(b["close"], 1))
+            for b in G_SPOT[-30:]]
+    sig = G_SIG[-1] if G_SIG else {}
+    return dict(
+        bar_time=state.get("bar_time"), last_30_bars=bars,
+        pdh=G_PDC.get("prev_day_high"), pdl=G_PDC.get("prev_day_low"), pdc=G_PDC.get("prev_day_close"),
+        vix=G_PDC.get("vix_close"), expected_move_1min=state.get("expected_move_1min"),
+        twap=state.get("running_twap"), regime=state.get("regime"),
+        breakouts={k: v.get("status") for k, v in (state.get("bo_state") or {}).items()},
+        options_flow=dict(final_signal=sig.get("final_signal_value"),
+                          itm_call=sig.get("itm_call_sentiments_sum"), itm_put=sig.get("itm_put_sentiments_sum"),
+                          otm_call=sig.get("otm_call_sentiments_sum"), otm_put=sig.get("otm_put_sentiments_sum")),
+        engine_position=state.get("wf_position"),
+        engine_candidates=[dict(strategy=d["strategy"], direction=d["direction"], score=d["score"],
+                                approved=bool(d["tier"])) for d in state.get("gate_decisions", [])],
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1293,9 +1608,13 @@ def create_trapx_app(memory: MemorySaver):
     wf.add_node("market_memory_engine",     market_memory_engine)
     wf.add_node("regime_detector",          regime_detector)
     wf.add_node("check_trigger",            check_trigger)
+    wf.add_node("breakout_validator",       breakout_validator)
     wf.add_node("workflow_strategy_engine", workflow_strategy_engine)
     wf.add_node("trap_trigger_engine",      trap_trigger_engine)
+    wf.add_node("conviction_gate",          conviction_gate)
+    wf.add_node("position_manager",         position_manager)
     wf.add_node("trade_lifecycle_manager",  trade_lifecycle_manager)
+    wf.add_node("ai_analyst",               ai_analyst)
     wf.add_node("minute_summary",           minute_summary)
 
     # Conditional entry from START
@@ -1312,12 +1631,15 @@ def create_trapx_app(memory: MemorySaver):
     wf.add_edge("process_minute",           "market_memory_engine")
     wf.add_edge("market_memory_engine",     "regime_detector")
     wf.add_edge("regime_detector",          "check_trigger")
-    # Workflow strategies run after structural trigger detection
-    wf.add_edge("check_trigger",            "workflow_strategy_engine")
+    wf.add_edge("check_trigger",            "breakout_validator")
+    # Strategies propose → bar is scored → setups are gated → positions managed
+    wf.add_edge("breakout_validator",       "workflow_strategy_engine")
     wf.add_edge("workflow_strategy_engine", "trap_trigger_engine")
-
-    wf.add_edge("trap_trigger_engine",      "trade_lifecycle_manager")
-    wf.add_edge("trade_lifecycle_manager",  "minute_summary")
+    wf.add_edge("trap_trigger_engine",      "conviction_gate")
+    wf.add_edge("conviction_gate",          "position_manager")
+    wf.add_edge("position_manager",         "trade_lifecycle_manager")
+    wf.add_edge("trade_lifecycle_manager",  "ai_analyst")
+    wf.add_edge("ai_analyst",               "minute_summary")
     wf.add_edge("minute_summary",           END)
 
     return wf.compile(checkpointer=memory)
@@ -1329,7 +1651,7 @@ def create_trapx_app(memory: MemorySaver):
 def print_session_summary(st: Dict):
     tlog   = st.get("trade_log", [])
     trades = [e for e in tlog if e["action"] == "ENTRY"]
-    exits  = [e for e in tlog if e["action"] in ("TIME_EXIT", "STRUCTURAL_EXIT")]
+    exits  = [e for e in tlog if e["action"] in ("TIME_EXIT", "STRUCTURAL_EXIT", "EOD_EXIT")]
     pnls   = [e.get("pnl_pts", 0) for e in exits]
 
     print("\n" + "═"*65)
@@ -1381,7 +1703,184 @@ def print_session_summary(st: Dict):
     if wf_entry:
         print(f"  Workflow last entry     : {wf_entry.get('strategy','?')}"
               f"  @ {wf_entry.get('entry_price', 0):.2f}")
+
+    # ── Breakouts, gate, executions, risk ────────────────────────────────────
+    elog = st.get("exec_log", [])
+    print(f"\n  ── Breakout validation ─────────────────────────────────────")
+    for e in (x for x in elog if x["type"] == "BREAKOUT"):
+        print(f"    Bar {e['bar_time']}  {e['action']:<12} {e.get('note','')}")
+    print(f"\n  ── Executions (gate ≥ {CFG['conviction_threshold']}) ──────────────────────────")
+    for e in (x for x in elog if x["type"] in ("ENTRY", "EXIT", "SKIP", "RISK")):
+        if e["type"] == "ENTRY":
+            print(f"    Bar {e['bar_time']}  ENTRY {e['strategy']} {e['direction']:<4} @{e['price']:.2f}  "
+                  f"score={e['score']} {e['tier']}  {e.get('note','')}")
+        elif e["type"] == "EXIT":
+            print(f"    Bar {e['bar_time']}  {e['action']:<14} @{e['price']:.2f}  "
+                  f"{e['pnl_pts']:+.2f} pts  ₹{e['pnl_inr']:+,}  ({e['r_multiple']:+.2f}R)")
+        elif e["type"] == "SKIP":
+            print(f"    Bar {e['bar_time']}  SKIP  {e['strategy']} {e['direction']:<4} "
+                  f"score={e.get('score','—')}  {e.get('note','')}")
+        else:
+            print(f"    Bar {e['bar_time']}  {e['action']}  {e.get('note','')}")
+    exits = [x for x in elog if x["type"] == "EXIT"]
+    print(f"\n  Workflow trades closed  : {len(exits)}  "
+          f"(wins {sum(1 for x in exits if x['pnl_inr'] > 0)} / losses {sum(1 for x in exits if x['pnl_inr'] <= 0)})")
+    print(f"  Realized P&L            : ₹{st.get('realized_pnl', 0):+,.0f}  on ₹{CFG['capital']:,} notional")
+    print(f"  Max drawdown            : {st.get('max_drawdown_pct', 0):.2f}%   "
+          f"(kill switch at {CFG['max_daily_loss_pct']}% daily loss"
+          f"{' — TRIGGERED' if st.get('kill_switch') else ''})")
+    print(f"  AI opinions             : {len(st.get('ai_opinions', []))}")
     print("═"*65)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Replay driver  (shared by the CLI below and dashboard/server.py)
+# ─────────────────────────────────────────────────────────────────────────────
+def load_session_data():
+    """Load SPOT / FUTURE / signal frames for the replay date."""
+    df = pd.read_csv(SPOT_FUT_CSV)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], format="%d-%m-%Y %H:%M")
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    spot_df = df[df["instrument_type"] == "SPOT"].copy().reset_index(drop=True)
+    fut_df  = df[df["instrument_type"] == "FUTURE"].copy().reset_index(drop=True)
+    sig_df  = pd.read_csv(SIGNALS_CSV)
+    sig_df["timestamp"] = pd.to_datetime(sig_df["timestamp"])
+    sig_df = sig_df.sort_values("timestamp").reset_index(drop=True)
+    return spot_df, fut_df, sig_df
+
+
+def run_replay(app=None, limit: Optional[int] = None, on_bar=None,
+               delay: float = 0.0, verbose: bool = True) -> Dict:
+    """Replay the session bar-by-bar through the graph.
+
+    app      : compiled graph (or a langgraph-viz wrapper); built if None
+    limit    : stop after N bars (None = full session)
+    on_bar   : optional callback(record: dict) fired after every bar
+    Returns  : {"final": final_state, "bars": [per-bar records]}
+    """
+    global G_AI
+    G_SPOT.clear(); G_FUT.clear(); G_SIG.clear(); G_PDC.clear()
+    from trapx_ai import AIAnalyst
+    G_AI = AIAnalyst()
+    if verbose:
+        print(f"  AI analyst           : {'on · ' + G_AI.status['provider'] + ' · ' + str(G_AI.status['model']) if G_AI.enabled else 'off (' + G_AI.reason + ')'}")
+
+    spot_df, fut_df, sig_df = load_session_data()
+    session_start_ts = pd.Timestamp("2026-02-20 09:15:00")
+    spot_minutes = spot_df[spot_df["timestamp"] >= session_start_ts]["timestamp"].sort_values().unique()
+    if limit:
+        spot_minutes = spot_minutes[:limit]
+    total = len(spot_minutes)
+
+    if verbose:
+        last_bar_ts = pd.Timestamp(spot_minutes[-1])
+        print(f"  SPOT bars in session : {total}")
+        print(f"  First closed bar     : {pd.Timestamp(spot_minutes[0]).strftime('%H:%M')}")
+        print(f"  Last  closed bar     : {last_bar_ts.strftime('%H:%M')}")
+        print(f"  FUTURE bars          : {len(fut_df)}")
+        print(f"  Signal rows          : {len(sig_df)}")
+
+    if app is None:
+        app = create_trapx_app(MemorySaver())
+    config = {"configurable": {"thread_id": f"trapx-replay-{time.time_ns()}"}}
+
+    bars, n_wf, n_tl, n_ex, n_ai, final = [], 0, 0, 0, 0, {}
+    start_ts = time.time()
+    for i, bar_ts in enumerate(spot_minutes):
+        bar_ts = pd.Timestamp(bar_ts)
+        row = spot_df[spot_df["timestamp"] == bar_ts]
+        if row.empty:
+            continue
+        G_SPOT.append(row.iloc[0].to_dict())
+
+        fut_rows = fut_df[fut_df["timestamp"] <= bar_ts]
+        if not fut_rows.empty:
+            lf = fut_rows.iloc[-1].to_dict()
+            if not G_FUT or G_FUT[-1]["timestamp"] != lf["timestamp"]:
+                G_FUT.append(lf)
+
+        sig_rows = sig_df[sig_df["timestamp"] <= bar_ts]
+        if not sig_rows.empty:
+            ls = sig_rows.iloc[-1].to_dict()
+            if not G_SIG or G_SIG[-1].get("timestamp") != ls.get("timestamp"):
+                G_SIG.append(ls)
+
+        bar_time_str = bar_ts.strftime("%H:%M")
+        if i == 0:
+            # At 09:15, process_mkt_open fires AT the opening bell
+            trigger_time_str = "09:15"
+            header = f"  🔔  [09:15 IST]  MARKET OPEN  (process_mkt_open + process_minute)"
+        else:
+            # Every other bar: closed bar T is analysed at T+1
+            trigger_time_str = (bar_ts + pd.Timedelta(minutes=1)).strftime("%H:%M")
+            header = (f"  ⏱️   [{trigger_time_str} IST]  BAR {bar_time_str} CLOSED  "
+                      f"(bar #{i+1}/{total})")
+        if verbose:
+            print(f"\n{'─'*65}\n{header}\n{'─'*65}")
+
+        t0 = time.perf_counter()
+        final = app.invoke({"bar_index": i, "bar_time": bar_time_str,
+                            "trigger_time": trigger_time_str}, config,
+                           **({"durability": "exit"} if hasattr(app, "checkpointer") else {}))
+        latency_ms = (time.perf_counter() - t0) * 1000
+
+        spot, fut = G_SPOT[-1], (G_FUT[-1] if G_FUT else {})
+        sig = G_SIG[-1] if G_SIG else {}
+        wf_log, t_log = final.get("wf_trade_log", []), final.get("trade_log", [])
+        record = dict(
+            i=i, t=bar_time_str, trigger=trigger_time_str,
+            o=float(spot["open"]), h=float(spot["high"]),
+            l=float(spot["low"]),  c=float(spot["close"]),
+            fut_c=float(fut.get("close", 0.0)),
+            twap=final.get("running_twap", 0.0), atr=final.get("running_atr", 0.0),
+            regime=final.get("regime", "UNDEFINED"),
+            score=final.get("conviction_score", 0),
+            signal=float(sig.get("final_signal_value", 0.0) or 0.0),
+            wf_position=final.get("wf_position", "IDLE"),
+            lis=bool(final.get("big_lis_legs")) and final["big_lis_legs"][0].get("ts") == bar_time_str,
+            checklist={k: bool(v[0]) for k, v in (final.get("conviction_detail") or {}).items()},
+            in_trade=final.get("trade_state") == "IN_TRADE",
+            pdl_break=final.get("wf_pdl_break_bar", ""),
+            wick_rejections=final.get("wf_wick_rejections", 0),
+            fib_50=final.get("wf_fib_50", 0.0),
+            wf_events=wf_log[n_wf:], trade_events=t_log[n_tl:],
+            latency_ms=round(latency_ms, 2),
+            exec_events=final.get("exec_log", [])[n_ex:],
+            gate=final.get("gate_decisions", []),
+            bo={k: v.get("status") for k, v in (final.get("bo_state") or {}).items()},
+            pos=final.get("pos"),
+            equity=final.get("equity", CFG["capital"]),
+            dd=final.get("max_drawdown_pct", 0.0),
+            realized=final.get("realized_pnl", 0.0),
+            kill=final.get("kill_switch", False),
+            ai=final.get("ai_opinions", [])[n_ai:],
+        )
+        if i == 0:
+            record.update(pdc=dict(G_PDC), em=final.get("expected_move_1min"),
+                          ai_status=G_AI.status, cfg=dict(capital=CFG["capital"], lot_size=CFG["lot_size"],
+                                                         max_daily_loss_pct=CFG["max_daily_loss_pct"]))
+        n_wf, n_tl = len(wf_log), len(t_log)
+        n_ex, n_ai = len(final.get("exec_log", [])), len(final.get("ai_opinions", []))
+        bars.append(record)
+        if on_bar:
+            on_bar(record)
+
+        if verbose and ((i + 1) % 50 == 0 or (i + 1) == total):
+            print(f"\n  … {i+1}/{total} bars  ({(i+1)/total*100:.0f}%)  "
+                  f"elapsed={time.time() - start_ts:.1f}s\n")
+        if delay:
+            time.sleep(delay)
+
+    late_ai = G_AI.wait()               # opinions still in flight at the close
+    if late_ai:
+        final["ai_opinions"] = list(final.get("ai_opinions", [])) + late_ai
+    lat = sorted(b["latency_ms"] for b in bars)
+    if verbose:
+        print(f"\n  ✅  Replay complete: {total} bars in {time.time() - start_ts:.1f}s")
+    return {"final": final, "bars": bars, "pdc": dict(G_PDC), "late_ai": late_ai,
+            "latency": dict(mean=round(sum(lat) / len(lat), 2), p95=round(lat[int(len(lat) * .95) - 1], 2),
+                            max=round(lat[-1], 2)) if lat else {},
+            "ai_status": G_AI.status}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1416,10 +1915,10 @@ if __name__ == "__main__":
     _PID_FILE = os.path.join(_HERE, "trapx.pid")
     with open(_PID_FILE, "w") as _f:
         _f.write(str(os.getpid()))
-    print(f"  📋  Log file   : examples/logs/trapx_{_LOG_TS}.log")
-    print(f"  📌  PID {os.getpid()} written to examples/trapx.pid")
+    print(f"  📋  Log file   : logs/trapx_{_LOG_TS}.log")
+    print(f"  📌  PID {os.getpid()} written to trapx.pid")
     print(f"  🛑  To stop only this process:")
-    print(f"        PowerShell:  Stop-Process -Id (Get-Content examples/trapx.pid)")
+    print(f"        PowerShell:  Stop-Process -Id (Get-Content trapx.pid)")
     print(f"        Or just:     Ctrl+C  in this terminal")
 
     print("═"*65)
@@ -1432,112 +1931,33 @@ if __name__ == "__main__":
     print("  • 09:17 IST → process_minute for 09:16 closed bar  … etc")
     print("═"*65)
 
-    from langgraph_viz import visualize
-
-    # ── Load CSV data (outside LangGraph, stored in module globals) ────────────
     print("\n  📂  Loading CSV data …")
-    df = pd.read_csv(SPOT_FUT_CSV)
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-    df = df.sort_values("timestamp").reset_index(drop=True)
-    spot_df = df[df["instrument_type"] == "SPOT"].copy().reset_index(drop=True)
-    fut_df  = df[df["instrument_type"] == "FUTURE"].copy().reset_index(drop=True)
-    sig_df  = pd.read_csv(SIGNALS_CSV)
-    sig_df["timestamp"] = pd.to_datetime(sig_df["timestamp"])
-    sig_df = sig_df.sort_values("timestamp").reset_index(drop=True)
+    app = create_trapx_app(MemorySaver())
 
-    session_start_ts = pd.Timestamp("2026-02-20 09:15:00")
-    spot_session     = spot_df[spot_df["timestamp"] >= session_start_ts].copy()
-    spot_minutes     = spot_session["timestamp"].sort_values().unique()
-    last_bar_ts      = pd.Timestamp(spot_minutes[-1])
+    try:
+        from langgraph_viz import visualize
+    except ImportError:
+        visualize = None
 
-    print(f"  SPOT bars in session : {len(spot_minutes)}")
-    print(f"  First closed bar     : {spot_minutes[0].strftime('%H:%M')}  "
-          f"[analysed at {(spot_minutes[0] + pd.Timedelta(minutes=1)).strftime('%H:%M')} IST]")
-    print(f"  Last  closed bar     : {last_bar_ts.strftime('%H:%M')}  "
-          f"[analysed at {(last_bar_ts + pd.Timedelta(minutes=1)).strftime('%H:%M')} IST]")
-    print(f"  FUTURE bars          : {len(fut_df)}")
-    print(f"  Signal rows          : {len(sig_df)}")
+    if visualize is None:
+        print("  (langgraph-viz not installed – running headless; "
+              "use `python dashboard/server.py` for the web dashboard)\n")
+        result = run_replay(app)
+        print_session_summary(result["final"])
+    else:
+        print("\n  🎨  Starting LangGraph-Viz server …")
+        print("  🌐  Open http://localhost:8767 in your browser\n")
+        with visualize(app, port=8767) as viz_app:
+            result = run_replay(viz_app, delay=0.02)
+            print_session_summary(result["final"])
 
-    # ── Single graph, single memory, single config ────────────────────────────
-    memory = MemorySaver()
-    config = {"configurable": {"thread_id": "trapx-replay-001"}}
-    app    = create_trapx_app(memory)
-
-    print("\n  🎨  Starting LangGraph-Viz server …")
-    print("  🌐  Open http://localhost:8767 in your browser")
-    print(f"  ⏩  Replaying {len(spot_minutes)} bars  "
-          f"(09:15→{last_bar_ts.strftime('%H:%M')} closed)\n")
-
-    with visualize(app, port=8767) as viz_app:
-        start_ts = time.time()
-
-        for i, bar_ts in enumerate(spot_minutes):
-            # ── Accumulate data up to this bar ─────────────────────────────────
-            row = spot_df[spot_df["timestamp"] == bar_ts]
-            if row.empty:
-                continue
-            G_SPOT.append(row.iloc[0].to_dict())
-
-            fut_rows = fut_df[fut_df["timestamp"] <= bar_ts]
-            if not fut_rows.empty:
-                lf = fut_rows.iloc[-1].to_dict()
-                if not G_FUT or G_FUT[-1]["timestamp"] != lf["timestamp"]:
-                    G_FUT.append(lf)
-
-            sig_rows = sig_df[sig_df["timestamp"] <= bar_ts]
-            if not sig_rows.empty:
-                ls = sig_rows.iloc[-1].to_dict()
-                if not G_SIG or G_SIG[-1].get("timestamp") != ls.get("timestamp"):
-                    G_SIG.append(ls)
-
-            # ── Build timing labels ────────────────────────────────────────────
-            bar_time_str     = bar_ts.strftime("%H:%M")
-            if i == 0:
-                # At 09:15, process_mkt_open fires AT the opening bell
-                trigger_time_str = "09:15"
-                header = f"  🔔  [09:15 IST]  MARKET OPEN  (process_mkt_open + process_minute)"
-            else:
-                # Every other bar: closed bar T is analysed at T+1
-                trigger_time_str = (bar_ts + pd.Timedelta(minutes=1)).strftime("%H:%M")
-                header = (f"  ⏱️   [{trigger_time_str} IST]  BAR {bar_time_str} CLOSED  "
-                          f"(bar #{i+1}/{len(spot_minutes)})")
-
-            print(f"\n{'─'*65}")
-            print(header)
-            print(f"{'─'*65}")
-
-            # ── Single invoke ──────────────────────────────────────────────────
-            viz_app.invoke({
-                "bar_index":    i,
-                "bar_time":     bar_time_str,
-                "trigger_time": trigger_time_str,
-            }, config)
-
-            # Progress every 50 bars
-            if (i + 1) % 50 == 0 or (i + 1) == len(spot_minutes):
-                elapsed = time.time() - start_ts
-                print(f"\n  … {i+1}/{len(spot_minutes)} bars  "
-                      f"({(i+1)/len(spot_minutes)*100:.0f}%)  "
-                      f"elapsed={elapsed:.1f}s\n")
-
-            time.sleep(0.02)
-
-        elapsed = time.time() - start_ts
-        print(f"\n  ✅  Replay complete: {len(spot_minutes)} bars in {elapsed:.1f}s")
-
-        try:
-            final = viz_app.get_state(config).values
-            print_session_summary(final)
-        except Exception as e:
-            print(f"  (Could not fetch final state: {e})")
-
-        print("\n  ⏸️   Server running. Open http://localhost:8767 to explore.")
-        print("  Press Ctrl-C to exit.\n")
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            print("\n  👋  Shutting down TRAP-X …")
+            print("\n  ⏸️   Server running. Open http://localhost:8767 to explore.")
+            print("  Press Ctrl-C to exit.\n")
+            try:
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                print("\n  👋  Shutting down TRAP-X …")
 
     # ── Clean up PID file and log on exit ───────────────────────────────────────
     try:
